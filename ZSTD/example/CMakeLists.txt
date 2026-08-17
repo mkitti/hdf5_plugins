@@ -32,6 +32,21 @@ foreach (example ${dyn_examples})
   endif ()
 endforeach ()
 
+#-----------------------------------------------------------------------------
+# Regression test for decoding a zstd frame with no embedded content size
+# (ZSTD_CONTENTSIZE_UNKNOWN), as produced by zstd's streaming compression
+# API. This links against libzstd directly (unlike the examples above) to
+# build such a frame itself and inject it via H5Dwrite_chunk, bypassing
+# this plugin's own encoder.
+#-----------------------------------------------------------------------------
+add_executable (h5ex_d_zstd_streaming ${PROJECT_SOURCE_DIR}/h5ex_d_zstd_streaming.c)
+TARGET_C_PROPERTIES (h5ex_d_zstd_streaming ${LIB_TYPE})
+target_include_directories (h5ex_d_zstd_streaming PRIVATE ${ZSTD_INCLUDE_DIRS})
+target_link_libraries (h5ex_d_zstd_streaming PRIVATE ${H5PL_LINK_LIBS})
+if (NOT WIN32)
+  target_link_libraries (h5ex_d_zstd_streaming PRIVATE ${CMAKE_DL_LIBS})
+endif ()
+
 if (H5PL_BUILD_TESTING)
   macro (ADD_H5_TEST testname)
     add_test (
@@ -198,6 +213,31 @@ if (H5PL_BUILD_TESTING)
   add_custom_target(zstd_files ALL COMMENT "Copying files needed by zstd tests" DEPENDS ${zstd_files_list})
 
   ADD_H5_TEST (h5ex_d_zstd)
+
+  #---------------------------------------------------------------------
+  # h5ex_d_zstd_streaming self-checks its own round trip (via exit code)
+  # instead of diffing against checked-in reference output, since its
+  # output isn't just filter metadata -- it depends on the specific zstd
+  # frame bytes this test builds at run time.
+  #---------------------------------------------------------------------
+  add_test (
+      NAME h5ex_d_zstd_streaming-clearall
+      COMMAND ${CMAKE_COMMAND} -E remove h5ex_d_zstd_streaming.h5
+  )
+  if (NOT "${last_test}" STREQUAL "")
+    set_tests_properties (h5ex_d_zstd_streaming-clearall PROPERTIES DEPENDS ${last_test})
+  endif ()
+  set (last_test "h5ex_d_zstd_streaming-clearall")
+
+  add_test (
+      NAME h5ex_d_zstd_streaming
+      COMMAND $<TARGET_FILE:h5ex_d_zstd_streaming>
+      WORKING_DIRECTORY ${PROJECT_BINARY_DIR}
+  )
+  set_tests_properties (h5ex_d_zstd_streaming PROPERTIES
+      DEPENDS ${last_test}
+      ENVIRONMENT "HDF5_PLUGIN_PATH=${CMAKE_BINARY_DIR}/plugins")
+  set (last_test "h5ex_d_zstd_streaming")
 
 #  if (NOT DISABLE_H5ZSTD_ENCODER)
 #    #UD ZSTD

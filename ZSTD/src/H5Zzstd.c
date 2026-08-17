@@ -27,6 +27,97 @@ static size_t H5Z_filter_zstd(unsigned int flags, size_t cd_nelmts, const unsign
 #define PUSH_ERR2(func, minor, str, arg)                                                                     \
     H5Epush(H5E_DEFAULT, __FILE__, func, __LINE__, H5E_ERR_CLS, H5E_PLINE, minor, str, arg)
 
+/*
+ * Decompress a zstd frame whose decompressed size is not known ahead of
+ * time (e.g. produced by another implementation via zstd's streaming
+ * compression API). Grows *outbuf_ptr as needed. On success returns 0 with
+ * *outbuf_ptr set to a malloc'd buffer of exactly *outSize_ptr bytes, which
+ * becomes the caller's responsibility to free. On failure returns -1,
+ * frees any internally allocated buffer, and pushes an HDF5 error.
+ */
+static int
+H5Z_zstd_decompress_stream(const void *src, size_t srcSize, void **outbuf_ptr, size_t *outSize_ptr)
+{
+    ZSTD_DStream *dstream       = NULL;
+    void         *outbuf        = NULL;
+    size_t        outCapacity   = ZSTD_DStreamOutSize();
+    size_t        outUsed       = 0;
+    ZSTD_inBuffer input         = {src, srcSize, 0};
+    int           frameComplete = 0;
+    int           ret           = -1;
+
+    if (NULL == (dstream = ZSTD_createDStream())) {
+        PUSH_ERR("H5Z_zstd_decompress_stream", H5E_CALLBACK, "Can't create zstd decompression stream");
+        goto done;
+    }
+
+    size_t const initResult = ZSTD_initDStream(dstream);
+    if (ZSTD_isError(initResult)) {
+        PUSH_ERR2("H5Z_zstd_decompress_stream", H5E_CALLBACK,
+                  "Can't initialize zstd decompression stream: %s", ZSTD_getErrorName(initResult));
+        goto done;
+    }
+
+    if (NULL == (outbuf = malloc(outCapacity))) {
+        PUSH_ERR("H5Z_zstd_decompress_stream", H5E_CALLBACK, "Can't allocate zstd decompression buffer");
+        goto done;
+    }
+
+    while (!frameComplete) {
+        ZSTD_outBuffer output = {outbuf, outCapacity, outUsed};
+        size_t const   result = ZSTD_decompressStream(dstream, &output, &input);
+
+        if (ZSTD_isError(result)) {
+            PUSH_ERR2("H5Z_zstd_decompress_stream", H5E_CALLBACK, "zstd streaming decompression failed: %s",
+                      ZSTD_getErrorName(result));
+            goto done;
+        }
+
+        outUsed = output.pos;
+
+        if (result == 0) {
+            /* Frame is fully decoded and flushed. */
+            frameComplete = 1;
+        }
+        else if (output.pos == output.size) {
+            /* Output buffer is full but the frame isn't finished; grow it. */
+            void  *newbuf;
+            size_t newCapacity = outCapacity * 2;
+
+            if (newCapacity <= outCapacity) {
+                PUSH_ERR("H5Z_zstd_decompress_stream", H5E_CALLBACK,
+                         "zstd decompression buffer size overflow");
+                goto done;
+            }
+            if (NULL == (newbuf = realloc(outbuf, newCapacity))) {
+                PUSH_ERR("H5Z_zstd_decompress_stream", H5E_CALLBACK, "Can't grow zstd decompression buffer");
+                goto done;
+            }
+            outbuf      = newbuf;
+            outCapacity = newCapacity;
+        }
+        else if (input.pos == input.size) {
+            /* No more input, but zstd says the frame isn't done. */
+            PUSH_ERR("H5Z_zstd_decompress_stream", H5E_CALLBACK,
+                     "zstd stream ended before frame was complete (truncated data?)");
+            goto done;
+        }
+        /* else: output buffer has room and input remains; keep decoding. */
+    }
+
+    *outbuf_ptr  = outbuf;
+    *outSize_ptr = outUsed;
+    outbuf       = NULL; /* ownership transferred to caller */
+    ret          = 0;
+
+done:
+    if (dstream)
+        ZSTD_freeDStream(dstream);
+    if (outbuf)
+        free(outbuf);
+    return ret;
+}
+
 const H5Z_class2_t H5Z_ZSTD[1] = {{
     H5Z_CLASS_T_VERS,              /* H5Z_class_t version */
     (H5Z_filter_t)H5Z_FILTER_ZSTD, /* Filter id number             */
@@ -68,31 +159,39 @@ H5Z_filter_zstd(unsigned int flags, size_t cd_nelmts, const unsigned int cd_valu
     if (flags & H5Z_FLAG_REVERSE) {
         /* We're decompressing */
         unsigned long long contentSize = ZSTD_getFrameContentSize(*buf, origSize);
+        size_t             decompSize;
+
         if (contentSize == ZSTD_CONTENTSIZE_ERROR) {
             PUSH_ERR("H5Z_filter_zstd", H5E_CALLBACK, "Input is not a valid zstd frame");
             goto error;
         }
         if (contentSize == ZSTD_CONTENTSIZE_UNKNOWN) {
-            PUSH_ERR("H5Z_filter_zstd", H5E_CALLBACK,
-                     "zstd frame missing decompressed size; data was likely compressed "
-                     "with the zstd streaming API, which is not supported");
-            goto error;
+            /*
+             * The frame doesn't carry its decompressed size, e.g. because it
+             * was produced by another implementation using zstd's streaming
+             * compression API. Fall back to streaming decompression, which
+             * doesn't need the size up front.
+             */
+            if (0 != H5Z_zstd_decompress_stream(inbuf, origSize, &outbuf, &decompSize))
+                goto error;
         }
-        if (contentSize == 0) {
-            PUSH_ERR("H5Z_filter_zstd", H5E_CALLBACK, "zstd frame has zero decompressed size");
-            goto error;
-        }
+        else {
+            if (contentSize == 0) {
+                PUSH_ERR("H5Z_filter_zstd", H5E_CALLBACK, "zstd frame has zero decompressed size");
+                goto error;
+            }
 
-        if (NULL == (outbuf = malloc((size_t)contentSize))) {
-            PUSH_ERR("H5Z_filter_zstd", H5E_CALLBACK, "Can't allocate zstd decompression buffer");
-            goto error;
-        }
+            if (NULL == (outbuf = malloc((size_t)contentSize))) {
+                PUSH_ERR("H5Z_filter_zstd", H5E_CALLBACK, "Can't allocate zstd decompression buffer");
+                goto error;
+            }
 
-        size_t decompSize = ZSTD_decompress(outbuf, (size_t)contentSize, inbuf, origSize);
-        if (ZSTD_isError(decompSize)) {
-            PUSH_ERR2("H5Z_filter_zstd", H5E_CALLBACK, "zstd decompression failed: %s",
-                      ZSTD_getErrorName(decompSize));
-            goto error;
+            decompSize = ZSTD_decompress(outbuf, (size_t)contentSize, inbuf, origSize);
+            if (ZSTD_isError(decompSize)) {
+                PUSH_ERR2("H5Z_filter_zstd", H5E_CALLBACK, "zstd decompression failed: %s",
+                          ZSTD_getErrorName(decompSize));
+                goto error;
+            }
         }
 
 #ifdef ZSTD_DEBUG
